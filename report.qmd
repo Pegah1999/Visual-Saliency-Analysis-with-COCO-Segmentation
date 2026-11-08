@@ -1,0 +1,661 @@
+---
+title: "report - Visual Saliency"
+Name: Pegah Palizban
+format: html
+editor: visual
+execute:
+  echo: true
+---
+
+```{python}
+import importlib
+import subprocess
+import sys
+
+import pandas as pd
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import requests
+import json
+import random
+import zipfile
+import os
+import io
+
+from pprint import pprint
+from io import BytesIO
+from PIL import Image
+from shapely.geometry import Point, Polygon
+from tqdm import tqdm
+
+import json
+```
+
+# 3 Exploring COCO Data
+COCO 2017 instance segmentation annotations were downloaded from the official COCO dataset website. Eye-tracking fixation data were obtained from the COCO-Search18 dataset. 
+* Due to the size of the datasets, files were downloaded manually and loaded locally.
+
+## 3.1 Loading Annotations Data
+A quick verification to see the instances data
+```{python}
+with open("data/coco/instances_train2017.json") as f:
+    coco_data = json.load(f)
+
+len(coco_data["images"]), len(coco_data["annotations"]), len(coco_data["categories"])
+```
+
+After reading the COCO dataset JSON file: 
+Now we break it down into three manageable Pandas DataFrames: 
+* one for images, 
+* one for object segments
+* one for category names
+
+```{python}
+# Extract the relevant columns from coco_data['images'] 
+# For later image loading, gaze scaling, and normalization
+images_df = pd.DataFrame([{
+    'file_name': image['file_name'],
+    'height': image['height'],
+    'width': image['width'],
+    'image_id': image['id'],
+    'address': image['coco_url']
+} for image in coco_data['images']])
+
+# Addiing image area to the "images_df" dataset
+images_df['image_area'] = images_df['height']*images_df['width']
+
+# Creating a dataframe of object segments
+annotations_df = pd.DataFrame(coco_data['annotations'])
+annotations_df = annotations_df.drop(columns=['iscrowd'])
+annotations_df = annotations_df.rename(columns={'area': 'segment_area','bbox': 'segment_bbox','id': 'segment_id'})
+
+categories_df = pd.DataFrame(coco_data['categories'])
+categories_df = categories_df.rename(columns={'id': 'category_id','name': 'category_name'})
+```
+
+## 3.2 Loading Fixations Data
+```{python}
+# URL of the zip file
+fixations_zip_url = "http://vision.cs.stonybrook.edu/~cvlab_download/COCOSearch18-fixations-TP.zip"
+
+# This function performs a series of operations to get data for a specific human subject
+def load_fixation_data_online(subject: int, zip_url: str) -> pd.DataFrame:
+    # Step 1: Download the zip file into memory
+    response = requests.get(zip_url)
+    response.raise_for_status()  # Ensure the request was successful
+
+    fixation_data = []
+
+    # Step 2: Open the zip file
+    # Instead of saving the zip to hard drive, I used "io.BytesIO" to open the file in RAM.
+    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+        # Step 3: Find files ending with '_split1.json'
+        split1_files = [f for f in z.namelist() if f.endswith('_split1.json')]
+        
+        # Step 4: Iterate through these files and read the JSON content
+        for json_file in split1_files:
+            with z.open(json_file) as f:
+                data = json.load(f)
+                
+                # Step 5: Filter entries for the specified subject
+                for entry in data:
+                    if entry['subject'] == subject:
+                        # Add the json_file column and append the entry
+                        entry['json_file'] = json_file
+                        fixation_data.append(entry)
+    
+    # Step 6: Create a DataFrame from the fixation data
+    df = pd.DataFrame(fixation_data)
+    
+    return df
+    
+# Load fixation data for the selected subject (from 1 to 10)
+subject_df = load_fixation_data_online(1, fixations_zip_url)
+
+
+subject_df = subject_df.drop(columns=['condition','split','json_file'])
+subject_df = subject_df.rename(columns={'name': 'image_name', 'task': 'category_name', 'length': 'no_gaze_points'})
+
+# Joining the eye-tracking data with the "image_df" 
+# Matching "image_name" from the "subject_df" to "file_name" from "images_df".
+subject_df_merged = pd.merge(subject_df, images_df, left_on=['image_name'], right_on=['file_name'], how='left')
+subject_df_merged = subject_df_merged.drop(columns=['file_name'])
+```
+
+### Data Analysis on "subject_df_merged" and "annotations_df"
+
+**1. Understanding the data**
+```{python}
+subject_df_merged.info()
+```
+
+```{python}
+subject_df_merged.head()
+```
+
+```{python}
+annotations_df.info()
+```
+
+```{python}
+annotations_df.head()
+```
+
+**2. Checking missing data**
+```{python}
+def missing_report(df):
+    return pd.DataFrame({
+        'missing_count': df.isna().sum(),
+    }).sort_values('missing_count', ascending=False)
+
+missing_report(subject_df_merged)
+missing_report(annotations_df)
+```
+
+# 4 Tasks to Do
+
+## 4.2 General Tasks
+
+### 4.2.1 Task G1. Single Mask on the Image
+Write a function that recieves an image and a segmentation mask and draws the mask on the image with a specified color and transparency (light blue color, 50% transparency).
+Steps to Create the Function
+
+* Fetch the Image: Use the coco_url in the images_df dataframe (column address) to download the image. We can use libraries like requests or urllib for this.
+
+* Parse the Segmentation Mask: The segmentation mask in the annotations_df dataframe (column segmentation) contains a list of coordinates for drawing the polygon.
+
+* Draw the Mask: Use a library like OpenCV or Pillow to overlay the segmentation mask on the image.
+
+* Display or Save the Result: Show the image with the mask using matplotlib or save it to a file.
+
+The formula used in "masked_image" is:
+        Pixel = (Overlay * alpha) + (Original * (1 - \alpha)) + gamma
+With alpha=0.5, the final pixel is 50% the mask color and 50% the original image pixel.
+
+```{python}
+def draw_single_mask(
+    image_url: str, segmentation: list, category_name: int,
+    color=(251, 203, 145),   # color in BGR format (light blue)
+    alpha: float = 0.5 ):
+    
+    # Download image + convert to GBR format
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image_np = np.array(image) # Give all the colors used in the image in RGB format 
+    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR) # convert to GBR
+
+    # COCO segmentation can have multiple polygons, took the first
+    # COCO stores segmentations as a flattened list of coordinates [x1, y1, x2, y2, ...]
+    polygon = np.array(segmentation[0]).reshape(-1, 2).astype(np.int32) # [[x1, y1], [x2, y2], ...]
+    polygon = polygon.reshape((-1, 1, 2)) # [[[x1, y1]], [[x2, y2]], ...]
+
+    # Drawing the Mask
+    overlay = image_bgr.copy()
+    cv2.fillPoly(overlay, [polygon], color) # Filling inside of the polygon with a color
+    # Drawing outline ("polylines" draws a solid border around the object)
+    cv2.polylines(overlay, [polygon], isClosed=True, 
+                    color=(255, 0, 0), thickness=2) # selected color is Blue in BGR format 
+
+    # Blend image and overlay
+    masked_image = cv2.addWeighted(overlay, alpha, image_bgr, 1 - alpha, 0)
+    # Convert back to RGB for plotting
+    masked_rgb = cv2.cvtColor(masked_image, cv2.COLOR_BGR2RGB)
+
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    axes[0].imshow(image_np)
+    axes[0].set_title("Original Image")
+    axes[0].axis("off")
+
+    axes[1].imshow(masked_rgb)
+    axes[1].set_title(f"Masked Image: {category_name}")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+```
+
+After creating the function, pass some random sample images from the COCO dataset along with its segmentation mask to the function and visualize the original and masked image side by side with the corresponding object category name as the title.
+
+Note: In case of several annotations for an image, choose the first corresponding annotation.
+
+```{python}
+# Pick a random image
+image_row = images_df.sample(1).iloc[0]
+image_id = image_row['image_id']
+
+# Get annotations corresponding to the image
+image_annotations = annotations_df[annotations_df['image_id'] == image_id]
+# Check if not annotation is found or not
+if image_annotations.empty:
+    raise ValueError(f"No annotations found for image_id {image_id}")
+
+# Pick the first annotation for the image
+sample_ann = image_annotations.iloc[0]
+
+# Draw the mask
+draw_single_mask(
+    image_url=image_row['address'],
+    segmentation=sample_ann['segmentation'],
+    category_name=sample_ann['category_id']
+)
+```
+
+### 4.2.2 Task G2. Multiple Masks on the Image
+
+For a random sample image from the COCO dataset, draw all the segmentation masks on the image and visualize the original and masked image side by side with transparency (50% transparency) and number of segments as the title.
+
+```{python}
+def draw_multiple_masks(image_url: str, segmentations: list, alpha: float = 0.5):
+
+    # 1. Download image
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image_np = np.array(image)
+
+    # Convert to BGR for OpenCV
+    image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+    # 2. Prepare overlay
+    overlay = image_bgr.copy()
+
+    # 3. Draw all segmentation masks
+    for seg in segmentations:
+        # Skip non-polygon (RLE) segmentations
+        if not isinstance(seg, list):
+            continue
+
+        for poly in seg:
+            polygon = np.array(poly).reshape(-1, 2).astype(np.int32)
+            polygon = polygon.reshape((-1, 1, 2))
+
+            # Light blue fill
+            cv2.fillPoly(overlay, [polygon], (251, 203, 145))
+
+            # Outline
+            cv2.polylines(overlay, [polygon], isClosed=True, color=(255, 0, 0), thickness=2)
+
+    # 4. Blend image and overlay
+    masked_image = cv2.addWeighted(overlay, alpha, image_bgr, 1 - alpha, 0)
+    masked_rgb = cv2.cvtColor(masked_image, cv2.COLOR_BGR2RGB) # Convert back to RGB
+
+    # 5. Plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    axes[0].imshow(image_np)
+    axes[0].set_title("Original Image")
+    axes[0].axis("off")
+
+    axes[1].imshow(masked_rgb)
+    axes[1].set_title(f"Masked Image ({len(segmentations)} segments)")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+```
+
+Testing the function with random images
+```{python}
+# Pick a random image
+sample_image = images_df.sample(1).iloc[0]
+image_id = sample_image["image_id"]
+
+image_url = sample_image["address"]
+
+# Get all annotations for this image
+image_annotations = annotations_df[ annotations_df["image_id"] == image_id ]
+# Collect segmentations
+segmentations = image_annotations["segmentation"].tolist()
+
+# Draw all masks
+draw_multiple_masks(image_url=image_url, segmentations=segmentations)
+```
+
+### 4.2.3 Task G3. Gaze Points on the Image
+
+Write a function that recives an image and gaze points and draws the gaze points on the image as follows:
+
+* Draw the bounding box (bbox) of the target object in red color.
+
+* For each gaze point, draw a circle at the (x, y) coordinates of the gaze point.
+
+* The radius of the circle should be proportional to the duration of the fixation.
+
+* Use a yellow color for the gaze points with 60% transparency and red border.
+
+* Connect the gaze points in the order they were recorded using a green line.
+
+* Use width = 1680 and height = 1050 as the reference size to visualize your results.
+
+**misaligned function**
+```{python}
+def draw_gaze_points_misaligned(
+    image_url: str,
+    gaze_x: list, gaze_y: list, gaze_t: list,
+    bbox: list, image_name: str, task: str ):
+
+    # Download image
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image_np = np.array(image)
+
+    fig, ax = plt.subplots()
+    ax.imshow(image_np)
+    ax.axis("off")
+
+    # Draw bounding box (with incorrect scale)
+    x, y, w, h = bbox
+    rect = plt.Rectangle( (x, y), w, h, linewidth=2, edgecolor="red", facecolor="none")
+    ax.add_patch(rect)
+
+    # Draw gaze points (with incorrect scale)
+    for i, (gx, gy, gt) in enumerate(zip(gaze_x, gaze_y, gaze_t)):
+        radius = gt
+        ax.scatter( gx, gy, s=radius, c="yellow", edgecolors="red", alpha=0.6)
+
+        if i > 0:
+            ax.plot( [gaze_x[i-1], gx], [gaze_y[i-1], gy], color="green")
+
+    ax.set_title(f"Misaligned Gaze Points\nImage: {image_name} | Task: {task}")
+    plt.show()
+```
+
+```{python}
+sample = subject_df_merged.sample(1).iloc[0]
+
+draw_gaze_points_misaligned(
+    image_url=sample["address"],
+    gaze_x=sample["X"], gaze_y=sample["Y"], gaze_t=sample["T"], bbox=sample["bbox"],
+    image_name=sample["image_name"], task=sample["category_name"] )
+```
+
+Explanation:
+
+It is clear that gaze points and bbox do not match the objects.
+Reason for mis-alignment:
+* COCO-Search18 gaze points were recorded on a fixed screen resolution of "1680 × 1050"
+So, plotting gaze points directly results in wrong coordinate system.
+
+**Solution:** Scale gaze points to the actual image resolution
+x_scaled​ = (x * image_width) / 1680​      &      y_scaled​ = (y * image_height​) / 1050
+
+**Aligned function**
+```{python}
+def draw_gaze_points_aligned(
+    image_url: str, gaze_x: list, gaze_y: list, gaze_t: list,
+    bbox: list, image_name: str, task: str,
+    ref_width: int = 1680, ref_height: int = 1050):
+    
+    # Download image
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image_np = np.array(image)
+
+    img_h, img_w = image_np.shape[:2]
+
+    # Scale gaze points
+    gaze_x_scaled = [x * img_w / ref_width for x in gaze_x]
+    gaze_y_scaled = [y * img_h / ref_height for y in gaze_y]
+
+    fig, ax = plt.subplots()
+    ax.imshow(image_np)
+    ax.axis("off")
+
+    # Draw bounding box
+    x, y, w, h = bbox
+    # Scale bounding box from 1680x1050 → image size
+    x = x * img_w / ref_width
+    y = y * img_h / ref_height
+    w = w * img_w / ref_width
+    h = h * img_h / ref_height
+
+    rect = plt.Rectangle((x, y), w, h, linewidth=2, edgecolor="red", facecolor="none")
+    ax.add_patch(rect)
+
+    # Draw gaze points
+    for i, (gx, gy, gt) in enumerate(zip(gaze_x_scaled, gaze_y_scaled, gaze_t)):
+        radius = gt
+        ax.scatter(gx, gy, s=radius, c="yellow", edgecolors="red", alpha=0.6)
+
+        ax.text(
+            gx, gy, str(i), color="black", fontsize=10, ha="center", va="center", zorder=4,
+            bbox=dict(facecolor="none", edgecolor="none", alpha=0.7))
+
+        # This if statement ensures the code doesn't try to draw a line for the very first point
+        # because there is no "previous" point to connect it to
+        if i > 0:
+            ax.plot([gaze_x_scaled[i-1], gx], [gaze_y_scaled[i-1], gy], color="green")
+
+    ax.set_title(f"Aligned Gaze Points\nImage: {image_name} | Task: {task}")
+    plt.show()
+
+    # Summary
+    print(f"Image Name: {image_name}")
+    print(f"Task: {task}")
+    print("Gaze Points (X, Y, Duration):")
+    for i, (x, y, t) in enumerate(zip(gaze_x, gaze_y, gaze_t), 1):
+        print(f"  {i}. X: {x:.1f}, Y: {y:.1f}, Duration: {t}")
+
+    print("\nBounding Box (x, y, w, h):")
+    print(f"  BBox: {bbox}")
+```
+
+```{python}
+sample = subject_df_merged.sample(1).iloc[0]
+
+draw_gaze_points_aligned(
+    image_url=sample["address"],
+    gaze_x=sample["X"], gaze_y=sample["Y"], gaze_t=sample["T"], bbox=sample["bbox"],
+    image_name=sample["image_name"], task=sample["category_name"] )
+```
+
+### 4.2.4 Task G4. Calculate Average Normalized Area
+
+Since COCO images vary significantly in resolution, raw object areas are not directly comparable across images. Therefore, we compute a normalized object area by dividing each object’s segmentation area by the total image area. The resulting percentage represents the proportion of the image occupied by the object. We then compute the average normalized area for each COCO category.
+
+```{python}
+# Merge annotations with image dimensions
+ann_img_df = annotations_df.merge( images_df[['image_id', 'image_area']], on='image_id', how='left' )
+
+# Calculate normalized area (%)
+ann_img_df['normalized_area_pct'] = ( ann_img_df['segment_area'] / ann_img_df['image_area'] ) * 100
+
+# Add category names
+ann_img_df = ann_img_df.merge(
+    categories_df,
+    on='category_id',
+    how='left'
+)
+
+# Calculate average normalized area per class
+avg_norm_area_df = (
+    ann_img_df.groupby('supercategory')['normalized_area_pct']
+    .mean().reset_index()
+    .sort_values(by='normalized_area_pct', ascending=False)
+)
+
+# Visualize as a bar chart
+plt.figure(figsize=(8, 12))
+
+plt.barh(
+    avg_norm_area_df['supercategory'],
+    avg_norm_area_df['normalized_area_pct']
+)
+
+plt.xlabel("Average Normalized Area (%)")
+plt.ylabel("COCO Category")
+plt.title("Average Normalized Object Area per COCO Category")
+
+plt.gca().invert_yaxis()  # largest on top (optional but nice)
+plt.tight_layout()
+plt.show()
+```
+
+
+## 4.3 Advanced Tasks
+
+### 4.3.1 Task A1. The Most Visually Attractive Object
+
+Which object class appears to be the most visually attractive? Propose an appropriate visualization to clearly present the results of your analysis.
+
+
+Quantify visual attractiveness as:
+How long people look at objects of a given class, on average, when those objects appear in a scene.
+
+1. Convert COCO segmentation to Shapely polygon
+In previous codes, I used OpenCV to draw shapes. 
+This function is different: it prepares the data so we can perform math on the shapes (such as checking if a gaze point is inside the object).
+
+COCO uses two types of segmentation:
+* Polygons: A list of (x, y) coordinates ([10, 20, 50, 60...]).
+* RLE (Run-Length Encoding): A compressed binary mask used for complex or "crowded" objects.
+Shapely needs coordinates to build a shape. Since RLE isn't a list of points, we should skips any non-polygon data to avoid errors.
+
+```{python}
+def coco_segmentation_to_polygon(segmentation):
+    # Convert COCO polygon segmentation to a Shapely Polygon.Returns None if segmentation is not polygon-based.
+
+    # Skip RLE / crowd annotations
+    if not isinstance(segmentation, list):
+        return None
+
+    # Checking that the list isn't empty.
+    if len(segmentation) == 0:
+        return None
+
+    coords = segmentation[0]
+
+    # Checking that there are at least three (x, y) pairs. We need at least 3 points (6 numbers in the initial list) to create a triangle, which is the simplest possible polygon. 
+    # Anything less is just a point or a line and cannot have an "area."
+    if len(coords) < 6:
+        return None  # not a valid polygon
+
+    # It bundles "coords" into a list of tuples. 
+    # This is the standard format required by most geometry libraries.
+    points = [(coords[i], coords[i + 1]) for i in range(0, len(coords), 2)]
+    
+    return Polygon(points)
+```
+
+2. Compute polygon area safely
+```{python}
+def polygon_area(polygon):
+    if polygon is None:
+        return 0
+    if not polygon.is_valid:
+        return 0
+    return polygon.area
+```
+
+3. Core Computation
+This code performs a Spatial Join between "human eye movements" and "object segmentations" to answer this question: "Which objects did the subject look at, and for how long?"
+(relative to the object's size)
+
+Processing data row-by-row would be chaotic because one image might have 50 different gaze points scattered throughout the table, so I used "groupby" for the "subject_df_merged" table.
+
+* It finds every unique image_id in your dataset.
+
+* It gathers all the rows belonging to that ID into a single "packet" or group.
+
+**Why this is useful:** Here I wanted to look at one image, find all the objects inside it, and then check all the gazes for that specific image before moving to the next one.
+
+```{python}
+results = []
+
+for image_id, img_fixations in subject_df_merged.groupby("image_id"):
+
+    # img_fixations is a Sub-DataFrame that contains only the rows from the main table that match a specific "image_id". It includes the (X, Y) coordinates and durations for every gaze point recorded for that specific picture.
+
+    image_annotations = annotations_df[ annotations_df["image_id"] == image_id ]
+
+    if image_annotations.empty:
+        continue
+
+    # Build polygons
+    objects = []
+
+    # The ".iterrows()" function returns two things for every row:
+        # Index (the row number or label) -> don't need it
+        # Series (the actual data in that row)
+    for _, annotaion in image_annotations.iterrows():
+        poly = coco_segmentation_to_polygon(annotaion["segmentation"])
+        area = polygon_area(poly)
+
+        if area > 0:
+            objects.append({ "category_id": annotaion["category_id"], "polygon": poly, "area": area })
+
+    # Iterate over gaze points
+    for _, row in img_fixations.iterrows():
+        for x, y, duration in zip(row["X"], row["Y"], row["T"]):
+            # For every gaze point (x, y) recorded for an image, the code creates a Shapely Point
+            point = Point(x, y)
+
+            # Iterating through all the objects in the image to see if the point falls inside the boundaries of the object's mask or not.
+            for obj in objects:
+                if obj["polygon"].contains(point):
+                    results.append({
+                        "category_id": obj["category_id"],
+                        "duration": duration,
+                        # Larger objects (like a wall or a floor) are naturally more likely to be looked at simply because they occupy more screen space. 
+                        # By dividing the gaze duration by the area of the object, we are calculating Gaze Density.
+                        # High Value: The person spent a lot of time looking at a relatively small, object.
+                        # Low Value: The person looked at the object, but the object is so huge that the "attention per pixel" is actually quite low.
+                        "normalized_duration": duration / obj["area"]
+                    })
+
+results_df = pd.DataFrame(results)
+```
+
+4. Aggregate by Object Class
+```{python}
+# Map category names
+results_df = results_df.merge(
+    categories_df[["category_id", "category_name", "supercategory"]],
+    left_on="category_id",
+    right_on="category_id",
+    how="left"
+)
+
+avg_duration_per_class = (
+    results_df.groupby("category_name")["normalized_duration"]
+    .mean()
+    .sort_values(ascending=False)
+)
+
+avg_duration_per_supercategory = (
+    results_df.groupby("supercategory")["normalized_duration"]
+    .mean()
+    .sort_values(ascending=False)
+)
+```
+
+5. Visualization
+```{python}
+plt.figure(figsize=(10, 8))
+avg_duration_per_class.head(15).plot(kind="barh")
+plt.xlabel("Average Normalized Fixation Duration")
+plt.ylabel("Object Class")
+plt.title("Most Visually Attractive Object Classes")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+plt.figure(figsize=(10, 8))
+avg_duration_per_supercategory.head(15).plot(kind="barh")
+plt.xlabel("Average Normalized Fixation Duration")
+plt.ylabel("Object Class")
+plt.title("Most Visually Attractive Object Supercategories")
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+```
+
+### Task A2. Average Percentage of Gaze Points
+
+
+
+
